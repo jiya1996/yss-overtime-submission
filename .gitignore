@@ -1,0 +1,34 @@
+# 运行时产物
+plan.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+.venv/
+venv/
+.python-version
+
+# 环境变量配置（含真实公司域名）
+.env
+.env.local
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 截图（debug 脚本输出到 %TEMP%/yss_skill_debug 不会到这里，但保险起见）
+*.png
+*.jpg
+*.jpeg
+
+# Playwright
+test-results/
+playwright-report/

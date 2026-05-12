@@ -30,6 +30,7 @@ from calculator import (
     OvertimeBill,
     compute_bill,
     diff_against_submitted,
+    split_long_overtime_bills,
 )
 
 
@@ -91,6 +92,7 @@ def main():
         b = compute_bill(r, prefer_compensation=not args.prefer_points)
         if b:
             all_bills.append(b)
+    all_bills = split_long_overtime_bills(all_bills)
 
     pending = diff_against_submitted(all_bills, submitted_dates)
     print(f"  应提交 {len(all_bills)} 条，已提交 {len(submitted_dates)} 个日期")
@@ -183,6 +185,11 @@ def main():
             "bill_type": b.bill_type,
             "usage": b.usage,
             "content": b.content,
+            "submit_start": b.submit_start,
+            "submit_end": b.submit_end,
+            "rest_minutes": b.rest_minutes,
+            "segment_index": b.segment_index,
+            "segment_count": b.segment_count,
         })
     plan_path.write_text(json.dumps(plan_data, ensure_ascii=False, indent=2),
                          encoding="utf-8")

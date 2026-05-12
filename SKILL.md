@@ -2,15 +2,15 @@
 name: yss-overtime-submission
 description: 自动计算和提交赢时胜（YSS）公司的加班单（奋斗单）。当用户提到"提加班单"、"提奋斗单"、"算加班时长"、"SHR 加班"、"我要奋斗"、"禅道考勤"、"补提加班"、"这周加班还没提"等场景时，必须使用本 skill。会从禅道 OA 考勤数据自动抓取打卡记录，结合中国大陆法定节假日和调休补班（chinese_calendar 库）正确判断工作日类型，按公司规则（工作日 19 点后 / 节假日打卡到打卡 + 午晚餐扣除）计算应报时长，与 SHR 已提交奋斗单做差集，从禅道工时确认拉取奋斗内容候选，生成待提交清单后通过 Playwright 半自动提交到金蝶 s-HR Cloud。
 author: jiya1996
-version: 2.0
-last_verified: 2026-05-08
+version: 2.1
+last_verified: 2026-05-12
 ---
 
 # 赢时胜加班单提交助手
 
 > **创建人**：jiya1996
-> **最后实测验证**：2026-05-08
-> **版本**：2.0（基于 5/8 实跑修正了 selectors / URL / 流程）
+> **最后实测验证**：2026-05-12
+> **版本**：2.1（补充单日超过 8h 的按开始时间拆分 + 分批提交）
 >
 > **分发给同事使用**：见 [`references/installation_for_colleagues.md`](references/installation_for_colleagues.md)
 > 本 skill 遵循 [agentskills.io](https://agentskills.io) 开放标准，可装在 Claude Code / OpenClaw / Cursor / Goose 等 30+ 兼容客户端里。
@@ -115,7 +115,7 @@ PYTHONIOENCODING=utf-8 python scripts/orchestrator.py \
 orchestrator 会：
 1. 抓禅道考勤打卡
 2. 抓 SHR 已提交奋斗单
-3. 计算应提交差集
+3. 计算应提交差集；单日超过 8h 时自动按开始时间拆分多条（如 09:44-18:44 8h + 18:45-21:45 3h）
 4. 填奋斗内容（**优先级**：`--content` 命令行 > 用户终端输入 > 禅道工时确认页拉建议）
 5. 把待提交清单存到 `plan.json`，dry-run 输出后退出
 
@@ -127,7 +127,7 @@ orchestrator 会：
 输出格式（示例）：
 ```
 === DRY RUN：以下 N 条**不会**真实提交 ===
-  • 2026-MM-DD 周X  HH:MM-HH:MM  报 X.Xh  [工作日/非工作日]  使用方式=...  | <奋斗内容>
+  • 2026-MM-DD 周X  HH:MM-HH:MM  报 X.Xh  [工作日/非工作日]  使用方式=...  分段=1/2  提交时段=HH:MM-HH:MM  | <奋斗内容>
 ```
 
 ### 阶段 2：确认无误后真正提交
@@ -147,6 +147,8 @@ PYTHONIOENCODING=utf-8 python scripts/orchestrator.py \
 提交流程：
 1. goto `SHR_BILL_MULTI_CREATE_URL` 直达多条创建网格
 2. 对每条单子：点 `#addRow_entries` → 填日期 → 等金蝶自动带类型/开始时间/使用方式 → 选积分下拉 → 填备注
+   - 若该日总时长超过 8h，脚本会把同一天拆成多条，并覆盖 SHR 自动带出的奋斗开始/结束时间、休息时长和隐藏申请时长缓存。
+   - 后续分段的开始时间必须和前一段不同（小时、分钟都建议错开 1 分钟），否则 SHR 会报「奋斗时间不能超过8个小时」。
 3. 点顶部 `#submit` 按钮 → 弹金蝶 messenger 确认 → 点「确认」 a 标签
 4. URL 跳到 `AtsOverTimeBillList` = 提交成功
 
@@ -167,6 +169,7 @@ PYTHONIOENCODING=utf-8 python scripts/orchestrator.py \
 - 加班 = 下班打卡 − 上班打卡 − 午晚餐扣除
 - 午餐扣除：上班打卡 < 12:00 时扣 1h
 - 晚餐扣除：下班打卡 ≥ 19:00 时扣 1h
+- 单日净时长 > 8h：自动拆分多条，默认第一条最多 8h，第二条从上一条结束后 1 分钟开始
 
 ## 文件结构
 
@@ -223,3 +226,4 @@ UI 改版让脚本失效是迟早的事。修复步骤：
 | 提交后弹的不是 native dialog，是金蝶 messenger 容器（`page.on("dialog")` 抓不到） | 找 `[class*="messenger"]` 里的「确认」 a 标签 click |
 | 禅道工时页的「名称」「描述」是 `<input value="...">` 不是 td 文本 | 用 `td.querySelector('input').value` |
 | 禅道工时 URL 不是 `m=effort&f=mywork`，是 `m=todo&f=confirmuserconsumed` | 已修正 selectors.py |
+| 单日加班超过 8h 时，同一张单里第二条如果沿用 SHR 自动带出的同一开始时间，会报「奋斗时间不能超过8个小时」 | 按起始时间拆分多条，第二段从上一段结束后 1 分钟开始，并同步更新 jqGrid data / row currentData / storeValue 三处缓存 |

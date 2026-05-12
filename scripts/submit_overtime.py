@@ -25,7 +25,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from datetime import date as Date
 from typing import List, Dict, Any
 
@@ -82,7 +81,41 @@ def submit_bills(bills: List[OvertimeBill],
         print("\n如需真正提交，加 --confirm 参数重跑。")
         return result
 
-    # === 真实提交 ===
+    batches = _submission_batches(bills)
+    if len(batches) > 1 and verbose:
+        print(f"\n📦 检测到单日超过 8h 的分段，拆成 {len(batches)} 批提交。")
+
+    for batch_idx, batch in enumerate(batches, start=1):
+        if len(batches) > 1:
+            print(f"\n【提交批次 {batch_idx}/{len(batches)}】")
+        batch_result = _submit_confirmed_batch(batch, verbose=verbose)
+        result["submitted"].extend(batch_result["submitted"])
+        result["failed"].extend(batch_result["failed"])
+        if batch_result["failed"]:
+            return result
+
+    return result
+
+
+def _submission_batches(bills: List[OvertimeBill]) -> List[List[OvertimeBill]]:
+    """为 SHR 提交分批：长单第一段可合并，后续分段单独提交。"""
+    first_batch: List[OvertimeBill] = []
+    later_batches: List[List[OvertimeBill]] = []
+
+    for bill in bills:
+        if bill.segment_count > 1 and bill.segment_index > 1:
+            later_batches.append([bill])
+        else:
+            first_batch.append(bill)
+
+    return ([first_batch] if first_batch else []) + later_batches
+
+
+def _submit_confirmed_batch(bills: List[OvertimeBill],
+                            verbose: bool = True) -> Dict[str, Any]:
+    """真实提交一个 SHR 多条创建批次。"""
+    result: Dict[str, Any] = {"submitted": [], "failed": [], "dry_run": False}
+
     with get_browser_context() as ctx:
         page = find_or_open_tab(ctx, SHR_URL_PREFIX,
                                 SHR_BILL_MULTI_CREATE_URL)
@@ -122,18 +155,15 @@ def submit_bills(bills: List[OvertimeBill],
             page.wait_for_timeout(1500)
             clicked = page.evaluate(f"""
                 (function(){{
-                   var btns = document.querySelectorAll('button, a');
+                   var btns = document.querySelectorAll('button, a, span, input[type=button]');
                    for (var i = 0; i < btns.length; i++) {{
                       var b = btns[i];
-                      if (!b.innerText) continue;
-                      var t = b.innerText.trim();
+                      var t = (b.innerText || b.value || b.title || '').trim();
                       if (t !== '{SHR_CONFIRM_DIALOG_OK_TEXT}' && t !== '确定') continue;
-                      if (b.offsetParent === null) continue;
+                      if (!(b.offsetWidth || b.offsetHeight || b.getClientRects().length)) continue;
                       if (b.closest('td')) continue;
-                      if (b.closest('.messenger, [class*="messenger"], [class*="modal"], [class*="dialog"]')) {{
-                         b.click();
-                         return 'ok';
-                      }}
+                      b.click();
+                      return 'ok';
                    }}
                    return null;
                 }})()
@@ -268,6 +298,131 @@ def _add_and_fill_row(page, bill: OvertimeBill, row_idx: int,
     desc_input.press("Tab")
     page.wait_for_timeout(600)
 
+    _apply_segment_overrides(page, bill, verbose=verbose)
+
+
+def _apply_segment_overrides(page, bill: OvertimeBill,
+                             verbose: bool = True) -> None:
+    """把拆分分段的开始/结束/休息时长写入 SHR jqGrid 真实缓存。
+
+    金蝶网格不是只读 DOM 提交；它还会读 wafGrid data、jQuery.data(row).currentData
+    和 table 的 storeValue。单日超过 8h 拆分时，必须三处一起同步。
+    """
+    if not (bill.submit_start and bill.submit_end):
+        return
+
+    if verbose:
+        print(f"     · 覆盖提交时段 {bill.submit_start}-{bill.submit_end}")
+
+    rest_minutes = 0 if bill.rest_minutes is None else int(bill.rest_minutes)
+    payload = {
+        "date": bill.date.isoformat(),
+        "start": f"{bill.date.isoformat()} {bill.submit_start}:00",
+        "end": f"{bill.date.isoformat()} {bill.submit_end}:00",
+        "hours": bill.hours,
+        "points": f"{bill.hours * 10:g}",
+        "integral": bill.hours,
+        "rest": rest_minutes,
+        "usage": bill.usage,
+        "content": (bill.content or "").strip(),
+    }
+
+    page.evaluate(
+        """
+        (payload) => {
+          const rows = Array.from(document.querySelectorAll('tr.jqgrow:not(.jqgfirstrow)'));
+          const row = rows[rows.length - 1];
+          if (!row) return;
+          const rowId = row.id;
+
+          function setText(aria, text) {
+            const td = row.querySelector(`td[aria-describedby="${aria}"]`);
+            if (!td) return;
+            td.textContent = text;
+            td.setAttribute('title', text);
+            td.classList.add('dirty-cell');
+          }
+
+          function setHtml(aria, value, text) {
+            const td = row.querySelector(`td[aria-describedby="${aria}"]`);
+            if (!td) return;
+            td.innerHTML = `<span value="${value}">${text}</span>`;
+            td.setAttribute('title', text);
+            td.classList.add('dirty-cell');
+          }
+
+          const content = payload.content;
+          const description = {l1: content, l2: content, l3: content};
+          const points = String(payload.points);
+          const integral = payload.integral;
+          const rest = String(payload.rest);
+          const apply = payload.hours;
+          const usageObj = payload.usage === '调休'
+            ? {
+                id: 'AERg0TIcSnaM40EKvJCdRKlrTmA=',
+                'BaseInfo.id': 'AERg0TIcSnaM40EKvJCdRKlrTmA=',
+                'BaseInfo.number': '001',
+                'BaseInfo.name': '调休',
+                name: '调休',
+              }
+            : undefined;
+
+          const grid = window.waf ? waf('#entries') : null;
+          if (grid) {
+            const data = grid.wafGrid('getGridParam', 'data') || [];
+            for (const item of data) {
+              if (String(item.__rowid) !== String(rowId)) continue;
+              item.integral = integral;
+              item.strugglePoints = points;
+              item.startTime = payload.start;
+              item.endTime = payload.end;
+              item.restTime = rest;
+              item.applyOTTime = apply;
+              item.description = description;
+              if (usageObj) item.otCompens = usageObj;
+            }
+            grid.wafGrid('setGridParam', {data});
+          }
+
+          if (window.jQuery) {
+            const tableData = jQuery.data(document.getElementById('entries')) || {};
+            const store = tableData.storeValue || {};
+            store[`integral-${rowId}`] = integral;
+            store[`strugglePoints-${rowId}`] = points;
+            store[`startTime-${rowId}`] = payload.start;
+            store[`endTime-${rowId}`] = payload.end;
+            store[`restTime-${rowId}`] = rest;
+            store[`applyOTTime-${rowId}`] = apply;
+            store[`description-${rowId}`] = description;
+            if (usageObj) store[`otCompens-${rowId}`] = usageObj;
+            tableData.storeValue = store;
+            jQuery.data(document.getElementById('entries'), tableData);
+
+            const rowData = jQuery.data(row).currentData || {};
+            rowData.integral = integral;
+            rowData.strugglePoints = points;
+            rowData.startTime = payload.start;
+            rowData.endTime = payload.end;
+            rowData.restTime = rest;
+            rowData.applyOTTime = apply;
+            rowData.description = description;
+            if (usageObj) rowData.otCompens = usageObj;
+            jQuery.data(row, 'currentData', rowData);
+          }
+
+          setText('entries_integral', String(payload.hours));
+          setText('entries_strugglePoints', String(payload.hours));
+          setText('entries_startTime', `${payload.date} ${payload.start.slice(11, 16)}`);
+          setText('entries_endTime', `${payload.date} ${payload.end.slice(11, 16)}`);
+          setHtml('entries_restTime', rest, rest);
+          setHtml('entries_applyOTTime', payload.hours, `${payload.hours.toFixed(2)}`);
+          setText('entries_description', content);
+          if (payload.usage === '调休') setText('entries_otCompens', '调休');
+        }
+        """,
+        payload,
+    )
+
 
 def load_plan(path: str) -> List[OvertimeBill]:
     """从 JSON 加载待提交清单（orchestrator 生成的中间产物）。"""
@@ -284,6 +439,11 @@ def load_plan(path: str) -> List[OvertimeBill]:
             bill_type=d["bill_type"],
             usage=d["usage"],
             content=d.get("content", ""),
+            submit_start=d.get("submit_start", ""),
+            submit_end=d.get("submit_end", ""),
+            rest_minutes=d.get("rest_minutes"),
+            segment_index=int(d.get("segment_index", 1)),
+            segment_count=int(d.get("segment_count", 1)),
         ))
     return bills
 

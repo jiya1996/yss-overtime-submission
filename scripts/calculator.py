@@ -19,8 +19,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 
@@ -38,6 +38,19 @@ def _parse_hhmm(s: str) -> time:
     """
     h, m = s.strip().split(":")
     return time(int(h), int(m))
+
+
+def _format_hhmm(t: time) -> str:
+    """把 time 格式化成 'HH:MM'。"""
+    return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _add_hours(t: time, hours: float, extra_minutes: int = 0) -> time:
+    """给同一天内的 time 加小时/分钟。当前 skill 不支持跨天。"""
+    dt = datetime.combine(date.today(), t) + timedelta(hours=hours, minutes=extra_minutes)
+    if dt.date() != date.today():
+        raise ValueError("split overtime across midnight is not supported")
+    return dt.time().replace(second=0, microsecond=0)
 
 
 def _hours_between(start: time, end: time) -> float:
@@ -197,15 +210,28 @@ class OvertimeBill:
     bill_type: str          # '工作日' | '非工作日'
     usage: str              # '奋斗积分' | '调休'
     content: str = ''       # 奋斗内容（用户填）
+    submit_start: str = ''  # 可选：提交到 SHR 的奋斗开始时间 'HH:MM'
+    submit_end: str = ''    # 可选：提交到 SHR 的加班结束时间 'HH:MM'
+    rest_minutes: Optional[int] = None  # 可选：提交到 SHR 的休息时长（分钟）
+    segment_index: int = 1
+    segment_count: int = 1
 
     def to_line(self) -> str:
         """生成给用户看的一行摘要。"""
+        segment = ""
+        if self.segment_count > 1:
+            segment = f"  分段={self.segment_index}/{self.segment_count}"
+        submit_window = ""
+        if self.submit_start and self.submit_end:
+            submit_window = f"  提交时段={self.submit_start}-{self.submit_end}"
         return (
             f"{self.date} {self.weekday}  "
             f"{self.clock_in}-{self.clock_out}  "
             f"报 {self.hours:.1f}h  "
             f"[{self.bill_type}]  "
             f"使用方式={self.usage}"
+            f"{segment}"
+            f"{submit_window}"
             + (f"  | {self.content}" if self.content else "  | (待填奋斗内容)")
         )
 
@@ -242,6 +268,94 @@ def compute_bill(record: AttendanceRecord, prefer_compensation: bool = True) -> 
             bill_type='非工作日',
             usage='调休' if prefer_compensation else '奋斗积分',
         )
+
+
+MAX_SINGLE_SHR_HOURS = 8.0
+SEGMENT_GAP_MINUTES = 1
+
+
+def _non_workday_rest_minutes(start: time, end: time) -> int:
+    """计算某个非工作日提交分段里的休息分钟数。"""
+    rest = 0
+    if start < LUNCH_START:
+        rest += 60
+    if start < DINNER_START and end >= DINNER_END:
+        rest += 60
+    return rest
+
+
+def _segment_end_for_net_hours(start: time, hours: float, bill_type: str) -> tuple[time, int]:
+    """根据净申报时长反推出 SHR 分段结束时间和休息分钟数。"""
+    if bill_type == '非工作日':
+        # 先估一次是否跨餐，再用扣餐后的 gross 时长算最终结束。
+        probe_end = _add_hours(start, hours)
+        rest = _non_workday_rest_minutes(start, probe_end)
+        end = _add_hours(start, hours + rest / 60)
+        rest = _non_workday_rest_minutes(start, end)
+        return end, rest
+
+    end = _add_hours(start, hours)
+    return end, 0
+
+
+def split_overtime_bill(bill: OvertimeBill,
+                        max_hours: float = MAX_SINGLE_SHR_HOURS) -> list[OvertimeBill]:
+    """把单日超过 SHR 单条上限的加班单拆成多个提交分段。
+
+    SHR 对同一天单条奋斗时间有 8h 校验。超过 8h 时，必须拆成多条，
+    且后续分段的奋斗开始时间要与上一段错开。
+
+    >>> from datetime import date
+    >>> b = OvertimeBill(date(2026,5,10), '周日', '09:44', '22:58', 11.0, '非工作日', '奋斗积分')
+    >>> parts = split_overtime_bill(b)
+    >>> [(p.hours, p.submit_start, p.submit_end, p.rest_minutes) for p in parts]
+    [(8.0, '09:44', '18:44', 60), (3.0, '18:45', '21:45', 0)]
+    >>> w = OvertimeBill(date(2026,5,9), '周六', '09:01', '22:06', 3.0, '工作日', '奋斗积分')
+    >>> split_overtime_bill(w)[0] is w
+    True
+    """
+    if bill.hours <= max_hours:
+        return [bill]
+
+    parts: list[OvertimeBill] = []
+    remaining = bill.hours
+    start = _parse_hhmm(bill.clock_in if bill.bill_type == '非工作日' else '19:00')
+    idx = 1
+
+    while remaining > 0:
+        hours = min(max_hours, remaining)
+        end, rest_minutes = _segment_end_for_net_hours(start, hours, bill.bill_type)
+        parts.append(OvertimeBill(
+            date=bill.date,
+            weekday=bill.weekday,
+            clock_in=bill.clock_in,
+            clock_out=bill.clock_out,
+            hours=hours,
+            bill_type=bill.bill_type,
+            usage=bill.usage,
+            content=bill.content,
+            submit_start=_format_hhmm(start),
+            submit_end=_format_hhmm(end),
+            rest_minutes=rest_minutes,
+            segment_index=idx,
+            segment_count=0,  # 回填
+        ))
+        remaining = round(remaining - hours, 2)
+        idx += 1
+        if remaining > 0:
+            start = _add_hours(end, 0, SEGMENT_GAP_MINUTES)
+
+    for p in parts:
+        p.segment_count = len(parts)
+    return parts
+
+
+def split_long_overtime_bills(bills: list[OvertimeBill]) -> list[OvertimeBill]:
+    """批量拆分超过 8h 的单日加班单。"""
+    result: list[OvertimeBill] = []
+    for bill in bills:
+        result.extend(split_overtime_bill(bill))
+    return result
 
 
 def diff_against_submitted(bills: list[OvertimeBill],

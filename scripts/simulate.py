@@ -21,7 +21,13 @@ import argparse
 from datetime import date as Date, timedelta
 from typing import Dict, Tuple
 
-from calculator import AttendanceRecord, OvertimeBill, compute_bill, diff_against_submitted
+from calculator import (
+    AttendanceRecord,
+    OvertimeBill,
+    compute_bill,
+    diff_against_submitted,
+    split_overtime_bill,
+)
 from holidays import is_workday, get_day_label
 
 
@@ -37,6 +43,7 @@ MOCK_ATTENDANCE: Dict[Date, Tuple[str, str]] = {
     Date(2026, 4, 21): ("08:44", "18:46"),  # 周二正常
     Date(2026, 4, 22): ("08:49", "21:10"),  # 周三加班
     Date(2026, 4, 23): ("08:45", "22:07"),  # 周四加班
+    Date(2026, 5, 10): ("09:44", "22:58"),  # 周日长加班，净 11h，需要拆分
 
     # === 国庆节那周（2025-09-29 ~ 2025-10-08）===
     # 包含：国庆假期 + 假期前调休补班的周日 + 假期后正常上班
@@ -114,8 +121,10 @@ def simulate(start: Date, end: Date, prefer_compensation: bool = True) -> None:
     for r in records:
         bill = compute_bill(r, prefer_compensation=prefer_compensation)
         if bill:
-            all_bills.append(bill)
-            print(f"  ✓ {bill.to_line()}")
+            parts = split_overtime_bill(bill)
+            all_bills.extend(parts)
+            for part in parts:
+                print(f"  ✓ {part.to_line()}")
         else:
             print(f"  ✗ {r.date} {r.weekday} 不需提交（时长不够 / 当天未加班）")
 

@@ -93,14 +93,14 @@ LUNCH_START = time(12, 0)
 DINNER_START = time(18, 0)
 # 晚餐结束 = 加班起算点 = 19:00
 DINNER_END = time(19, 0)
-# 提交资格门槛：实际时长必须严格 > 此值
+# 提交资格门槛：实际时长必须 >= 此值
 ELIGIBILITY_THRESHOLD_HOURS = 1.0
 
 
 def calc_workday(clock_out: str) -> Optional[float]:
     """工作日加班时长。
 
-    规则：从 19:00 起算到下班打卡，必须严格 > 1h，向下取整到 0.5h。
+    规则：从 19:00 起算到下班打卡，必须 >= 1h，向下取整到 0.5h。
 
     Args:
         clock_out: 下班打卡时间，'HH:MM'
@@ -118,8 +118,8 @@ def calc_workday(clock_out: str) -> Optional[float]:
     True
     >>> calc_workday("19:30") is None
     True
-    >>> calc_workday("20:00") is None  # 严格 >1h，1h 不行
-    True
+    >>> calc_workday("20:00")  # exact 1h 可以提交
+    1.0
     >>> calc_workday("20:01")  # 1h1min → 1h
     1.0
     >>> calc_workday("20:30")  # 边界 1.5h
@@ -128,7 +128,7 @@ def calc_workday(clock_out: str) -> Optional[float]:
     end = _parse_hhmm(clock_out)
     raw = _hours_between(WORKDAY_OT_START, end)
 
-    if raw <= ELIGIBILITY_THRESHOLD_HOURS:
+    if raw < ELIGIBILITY_THRESHOLD_HOURS:
         return None
 
     return _floor_to_half(raw)
@@ -142,7 +142,7 @@ def calc_holiday(clock_in: str, clock_out: str) -> Optional[float]:
       若上班打卡 < 12:00：扣 1h 午餐
       若上班打卡 < 18:00 且 下班打卡 ≥ 19:00：扣 1h 晚餐
         （即必须完整跨越晚餐时段才扣；只跨入或只跨出都不扣）
-      必须 > 1h，向下取整到 0.5h
+      必须 >= 1h，向下取整到 0.5h
 
     >>> calc_holiday("11:48", "20:50")  # 扣午餐+扣晚餐
     7.0
@@ -175,7 +175,7 @@ def calc_holiday(clock_in: str, clock_out: str) -> Optional[float]:
     if start < DINNER_START and end >= DINNER_END:
         raw -= 1.0
 
-    if raw <= ELIGIBILITY_THRESHOLD_HOURS:
+    if raw < ELIGIBILITY_THRESHOLD_HOURS:
         return None
 
     return _floor_to_half(raw)

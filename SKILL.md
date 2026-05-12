@@ -161,7 +161,7 @@ PYTHONIOENCODING=utf-8 python scripts/orchestrator.py \
 **工作日（含调休补班）**：
 - 仅可申请奋斗积分
 - 加班 = 下班打卡 − 19:00
-- 必须 > 1h 才能提交
+- 必须 ≥ 1h 才能提交（exact 1h 可以提）
 - 向下取整到 0.5h
 
 **非工作日（含法定假日）**：
